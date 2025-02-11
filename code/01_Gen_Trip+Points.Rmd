@@ -1,0 +1,698 @@
+---
+title: "Generate Trip Start and End Points"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+$$
+\textbf{Objective:}\\
+\text{Generate Trip Start and End Points} \\\text{KDE process and presentation}
+$$
+
+$$
+\textbf{Install and Load packages}
+$$ 
+
+```{r}
+# Load required libraries
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(spatstat)
+library(sp)
+library(spdep)
+library(tmap)
+library(ggspatial)
+library(raster)
+```
+
+$$
+\textbf{Load and clean all the OSM data from QGIS}
+$$ 
+
+```{r}
+# Load the polygon (city district)
+district <- st_read("D:/R Urban Analytics/02/Bandra_OSM_data/Mumbai_Data_/mum_ward_bandra/mum_ward_bandra.shp")
+
+# Load influence point data
+
+# Transport
+bus_stops             <- st_read("D:/R Urban Analytics/02/Bandra_OSM_data/Mumbai_Data_/mum_bandra_bus_stop/mum_bandra_bus_stop.shp")
+education_insti       <- st_read("D:/R Urban Analytics/02/Bandra_OSM_data/Mumbai_Data_/education/education.shp")
+cinema_sports         <- st_read("D:/R Urban Analytics/02/Bandra_OSM_data/Mumbai_Data_/entertain/entertain.shp")
+shops                 <- st_read("D:/R Urban Analytics/02/Bandra_OSM_data/Mumbai_Data_/amenity/shop.shp")
+```
+
+```{r}
+# Drop all attributes except geometry
+# Ensure geometries only
+bus_stops <- st_geometry(bus_stops)
+education_insti <- st_geometry(education_insti)
+cinema_sports <- st_geometry(cinema_sports)
+shops <- st_geometry(shops)
+
+# Remove duplicate points # Dissolve overlapping points
+bus_stops           <- st_as_sf(st_union(bus_stops))  
+education_insti     <- st_as_sf(st_union(education_insti)) 
+cinema_sports       <- st_as_sf(st_union(cinema_sports)) 
+shops               <- st_as_sf(st_union(shops)) 
+
+# Ensure geometries are valid and consistent
+district <- st_make_valid(district)
+bus_stops <- st_make_valid(bus_stops)
+education_insti <- st_make_valid(education_insti)
+cinema_sports <- st_make_valid(cinema_sports)
+shops <- st_make_valid(shops)
+
+
+# Reproject all layers to a common projected CRS (UTM Zone 43N)
+projected_crs <- 32643
+
+district <- st_transform(district, projected_crs)
+bus_stops <- st_transform(bus_stops, projected_crs)
+education_insti <- st_transform(education_insti, projected_crs)
+cinema_sports <- st_transform(cinema_sports, projected_crs)
+shops <- st_transform(shops, projected_crs)
+```
+
+
+
+$$
+\textbf{Combine the POIs for KDE}
+$$ 
+
+
+```{r}
+# Combine all influence points into a single layer
+all_influences <- st_union(bus_stops, education_insti, cinema_sports, shops) # add more here
+
+# Ensure CRS consistency
+all_influences <- st_transform(all_influences, crs = projected_crs)
+district <- st_transform(district, crs = projected_crs)
+
+# Convert combined influence points to a spatstat point pattern
+all_influences_ppp <- as.ppp(st_coordinates(all_influences), W = as.owin(st_as_sfc(st_bbox(district))))
+```
+
+
+$$
+\textbf{KDE and Sampling for Greater Spatial Autocorrelation}
+$$ 
+
+```{r}
+# Perform KDE
+# Increase sigma for smoother KDE, emphasizing broader spatial influence
+kde <- density(all_influences_ppp, sigma = 200)  # Adjust sigma for KDE smoothing # Increase bandwidth
+# kde_raster <- as.im(kde)  # Convert to spatstat raster format
+
+# Convert KDE to an sf object for use in R
+# kde_sf <- as(kde_raster, "SpatialGridDataFrame") %>% st_as_sf()
+
+# Generate random points and weight them by KDE
+n_points <- 10000  # Number of synthetic points
+set.seed(42)
+
+# Generate random points within the district
+random_points <- st_sample(district, size = n_points, type = "random")  # Generate more points initially
+
+# Generate buffers around key layers and use proximity as a weight multiplier for KDE
+bus_stop_buffers <- st_buffer(bus_stops, dist = 500)  # 500-meter buffer
+
+# Extract coordinates of random points
+random_coords <- st_coordinates(random_points)
+
+overlap_weights <- st_intersects(random_points, bus_stop_buffers) %>%
+  lengths()  # Count overlaps for each point
+
+overlap_weights[is.na(overlap_weights)] <- 0
+
+# Use spatstat to get KDE values at these coordinates
+kde_values_at_points <- interp.im(kde, random_coords[, 1], random_coords[, 2])
+
+weighted_kde_values <- kde_values_at_points * overlap_weights
+
+normalized_kde_values <- weighted_kde_values / sum(weighted_kde_values, na.rm = TRUE)
+
+
+# Normalize KDE values to use as probabilities (remove NA values)
+# kde_values <- kde_values / sum(kde_values, na.rm = TRUE)
+# Normalize KDE values to probabilities
+# kde_values <- kde$v / sum(kde$v, na.rm = TRUE)
+# 
+# kde_values <- kde$v * overlap_weights  # Adjust KDE weights
+
+kde_values <- normalized_kde_values
+
+
+# Remove points with NA KDE values (if any)
+valid_indices <- !is.na(kde_values)
+random_points <- random_points[valid_indices]
+kde_values <- kde_values[valid_indices]
+
+# # Sample based on KDE weights
+# set.seed(42)
+selected_indices <- sample(seq_along(random_points), size = n_points, prob = kde_values, replace = TRUE)
+# final_points <- random_points[selected_indices]
+
+# Ensure both objects have the same CRS
+final_points <- st_transform(random_points[selected_indices], crs = projected_crs)
+
+# Create a clustered pattern based on KDE
+set.seed(42)
+cluster_points <- rpoispp(kde, n = n_points)
+
+# Convert spatstat points to sf object
+cluster_points_sf <- st_as_sf(data.frame(geometry = st_sfc(st_multipoint(cbind(cluster_points$x, cluster_points$y))), crs = projected_crs))
+# Assign CRS to cluster_points_sf
+st_crs(cluster_points_sf) <- projected_crs
+
+# # Convert final points to sf object
+final_points_sf <- st_as_sf(data.frame(geometry = final_points))
+```
+
+```{r}
+
+# Verify CRS of both datasets
+print(st_crs(final_points_sf))
+print(st_crs(cluster_points_sf))
+
+# Combine the clustered points with KDE-based sampling
+final_points_sf <- rbind(
+  st_as_sf(data.frame(geometry = final_points, crs = projected_crs)),
+  cluster_points_sf
+)
+
+# Remove duplicates in final_points_sf
+final_points_sf <- final_points_sf %>%
+  distinct(geometry, .keep_all = TRUE)  # Keep unique geometries
+
+# Add jitter to avoid exact overlaps
+final_points_sf <- final_points_sf %>%
+  mutate(
+    geometry = st_geometry(
+      st_jitter(st_as_sf(final_points_sf), amount = 1)  # Jitter by 1 unit
+    )
+  )
+```
+
+```{r}
+# Check geometry type
+geom_types <- st_geometry_type(final_points_sf)
+print(table(geom_types))  # View the count of geometry types
+
+# Filter only POINT geometries if necessary
+if (any(geom_types != "POINT")) {
+  final_points_sf <- final_points_sf %>% filter(st_geometry_type(.) == "POINT")
+}
+
+# Check geometry type
+geom_types <- st_geometry_type(final_points_sf)
+print(table(geom_types))  # View the count of geometry types
+
+
+# Check for missing geometries
+missing_geometries <- sum(is.na(st_is_empty(final_points_sf)))
+cat("Missing geometries:", missing_geometries, "\n")
+
+# Check for NA coordinates
+coords <- st_coordinates(final_points_sf)
+na_coords <- any(is.na(coords))
+cat("NA in coordinates:", na_coords, "\n")
+
+# Remove missing geometries
+final_points_sf <- final_points_sf %>%
+  filter(!st_is_empty(geometry))  # Remove rows with empty geometries
+
+# Remove NA coordinates
+coords <- st_coordinates(final_points_sf)  # Extract coordinates
+final_points_sf <- final_points_sf[!is.na(coords[, 1]) & !is.na(coords[, 2]), ]  # Remove rows with NA
+```
+
+$$
+\textbf{Introduce Spatial Autocorrelation Metrics}
+$$ 
+
+```{r}
+# Problem: There's no verification of the degree of spatial autocorrelation in the generated points.
+# Solution:
+# Use Moran's I to ensure spatial autocorrelation is appropriate.
+# Apply spdep for spatial weights and autocorrelation testing.
+```
+
+```{r}
+
+# Generate spatial weights (k-nearest neighbors)
+coords <- st_coordinates(final_points_sf)
+neighbors <- knearneigh(coords, k = 5)
+weights <- nb2listw(knn2nb(neighbors))
+
+# Calculate Moran's I
+moran_test <- moran.test(coords[, 1], listw = weights)
+print(moran_test)
+
+# Ensure autocorrelation is significant
+if (moran_test$p.value > 0.05) {
+  warning("Generated points may lack sufficient spatial autocorrelation.")
+} else {
+  warning("So far so good")
+}
+
+# Reproject the CRS from UTM to EPSG:4326 (WGS 84)
+final_points_sf <- st_transform(final_points_sf, crs = 4326)
+
+# Check the points
+final_points_sf
+```
+
+```{r}
+# Extract latitude and longitude
+points_df <- final_points_sf |> 
+  mutate(
+    id = row_number(),  # Create an ID column
+    latitude = st_coordinates(final_points_sf)[, 2],  # Extract latitude
+    longitude = st_coordinates(final_points_sf)[, 1]
+    # ,  # Extract longitude
+    # type = 0  # Assign type (can change as needed)
+  )
+
+# remove the extra col
+points_df <- points_df[,c(2,3,4,5)]
+
+summary(points_df)
+
+# Save the points as a shape file
+
+# Define the output file path
+output_file <- "D:/R Urban Analytics/code/01_KDE_Trip_points/KDE_Generated_Trip_Points.shp"
+
+# Save the sf object as a shapefile
+st_write(points_df, output_file, delete_dsn = TRUE)
+
+# Confirmation message
+cat("Shapefile saved to:", output_file, "/n")
+```
+
+
+$$
+\textbf{Visualise the Steps for Presentation}
+$$ 
+```{r}
+# Define Consistent Coordinate Limits
+
+# Get the bounding box of the district layer
+bbox <- st_bbox(district)
+
+# Define padding as a percentage of the range
+padding_factor <- 0.05  # 5% padding
+
+# Get the bounding box of the district layer
+xrange <- bbox["xmax"] - bbox["xmin"]
+yrange <- bbox["ymax"] - bbox["ymin"]
+
+xlim <- c(bbox["xmin"] - xrange * padding_factor, bbox["xmax"] + xrange * padding_factor)
+ylim <- c(bbox["ymin"] - yrange * padding_factor, bbox["ymax"] + yrange * padding_factor)
+```
+
+$$
+\textbf{Plot and save the Point of Interest Data}
+$$ 
+
+```{r}
+# Points of Interest
+ggplot() +
+  geom_sf(data = district, fill = "azure", color = "black", show.legend = FALSE) +
+  geom_sf(data = bus_stops, aes(color = "Bus Stops"), size = 1) +
+  geom_sf(data = education_insti, aes(color = "Educational Institutes"), size = 1) +
+  geom_sf(data = cinema_sports, aes(color = "Cinema and Sports"), size = 1) +
+  geom_sf(data = shops, aes(color = "Shops"), size = 1) +
+  scale_color_manual(
+    name = "Legend", 
+    values = c(
+      "Bus Stops" = "darkblue", 
+      "Educational Institutes" = "red",
+      "Cinema and Sports" = "brown",
+      "Shops" = "coral"
+    )
+  ) +
+  coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Points of Interest within Bandra",
+    subtitle = "Spatial Distribution of Amenities and Transport Points",
+    caption = "Source: OpenStreetMap Data (December 2024)",
+       x = "Longitude", y = "Latitude"
+  ) +
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+
+```
+
+
+```{r}
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/Pt_interest_Bandra.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+```{r}
+# KDE
+
+# Convert KDE to raster
+kde_raster <- raster(kde)
+
+# Convert raster to a data frame for ggplot
+kde_df <- as.data.frame(as(kde_raster, "SpatialPixelsDataFrame"))
+
+ggplot() + 
+  geom_sf(data = district, fill = "white", color = "black", show.legend = TRUE) +   
+  geom_raster(data = kde_df, aes(x = x, y = y, fill = layer), alpha = 0.85) +
+  scale_fill_viridis_c(name = "Density") +
+  coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "Kernel Density Estimation (Sigma = 200)",
+    subtitle = "Compute KDE density surface based on the spatial distribution over a point pattern",
+    caption = "sigma controls the bandwidth (Larger sigma results in broader, smoother density surface)",
+    x = "Longitude", y = "Latitude"
+  )+ 
+
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+```
+
+```{r}
+# KDE
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/01_a_KDE_Buffer.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+```{r}
+# Random Points
+ggplot() + 
+  geom_sf(data = district, fill = "azure", color = "black", show.legend = FALSE) +   
+  geom_sf(data = random_points, aes(color = "Random Points"), size = 1) +   
+  scale_color_manual(
+    name = "Legend", 
+    values = c(
+      "Random Points" = "darkblue"
+    )
+  ) +
+  coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+  theme_minimal() + 
+  labs(
+    title = "Random Points populated within Bandra",
+    subtitle = "Generate random points within the boundary",
+    caption = "allows sampling within a spatial object",
+       x = "Longitude", y = "Latitude"
+  ) + 
+
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+```
+
+```{r}
+# Random Points
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/01_b_KDE_Random Points.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+```{r}
+#  Buffers Around Key Layers - Bus Stops
+bus_stop_buffers <- st_buffer(bus_stops, dist = 235) # Values modified only for visualisation
+#bus_stop_buffers_ <- st_buffer(bus_stops, dist = 150) # Values modified only for visualisation
+
+ggplot() + 
+  # Base map of the district
+  geom_sf(data = district, fill = "azure", color = "black", show.legend = FALSE) +   
+  
+  # Plot bus stops
+  geom_sf(data = bus_stops, aes(color = "Bus Stops"), size = 1) +
+  
+  # Plot buffer zones around bus stops
+  geom_sf(data = bus_stop_buffers, fill = "orange", alpha = 0.35, aes(color = "Buffer")) +   
+  
+  # Plot buffer zones around bus stops
+  #geom_sf(data = bus_stop_buffers_, fill = "orange", alpha = 0.35, aes(color = "Buffer")) +   
+   
+  scale_color_manual(
+    name = "Legend", 
+    values = c(
+      "Buffer" = "orange", 
+      "Bus Stops" = "darkblue"
+    )
+  ) +
+  coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+  theme_minimal() + 
+  # Add titles and captions
+  labs(
+    title = "Buffer Zones Around Bus Stops in Bandra",
+    subtitle = "Visualization of 235-meter buffer zones around bus stops",
+    caption = "Points within buffer receive additional weight simulating higher activity/influence",
+       x = "Longitude", y = "Latitude"
+  ) + 
+
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+```
+
+```{r}
+# Buffers Around Key Layers - Bus Stops
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/01_c_KDE_Buffer.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+```{r}
+# final points
+ggplot() + 
+  # Base map of the district
+  geom_sf(data = district, fill = "azure", color = "black", show.legend = FALSE) +   
+  
+  # Plot bus stops
+  geom_sf(data = final_points_sf, aes(color = "Selected Points"), size = 1) +
+
+   
+  scale_color_manual(
+    name = "Legend", 
+    values = c(
+      "Selected Points" = "orange"
+    )
+  ) +
+  coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+  theme_minimal() + 
+  # Add titles and captions
+  labs(
+    title = "Selected points based on the weighted KDE probabilities",
+    subtitle = "Generated points from the KDE surface using a Poisson point process",
+    caption = "Create a clustered pattern around high KDE regions",
+       x = "Longitude", y = "Latitude"
+  ) + 
+
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+```
+
+```{r}
+# final points
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/01_d_final_points.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+
+
+```{r}
+# base map
+ggplot() + 
+  # Base map of the district
+  geom_sf(data = district, fill = "azure", color = "black", show.legend = FALSE, alpha = 0.35) +   
+  
+  # Plot bus stops
+  #geom_sf(data = final_points_sf, aes(color = "Selected Points"), size = 1) +
+
+   
+  # scale_color_manual(
+  #   name = "Legend", 
+  #   values = c(
+  #     "Selected Points" = "orange"
+  #   )
+  # ) +
+  coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+  theme_minimal() + 
+  # Add titles and captions
+  labs(
+    title = "Bandra Ward",
+    subtitle = "Selected area to test the workflow",
+    caption = "Source: Survey of India",
+       x = "Longitude", y = "Latitude"
+  ) + 
+
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+```
+
+```{r}
+# final points
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/01_e_Bandra.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```

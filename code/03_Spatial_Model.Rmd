@@ -1,0 +1,692 @@
+---
+title: "Spatial Model"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+$$
+\textbf{Objective:}\\
+\text{Run Spatial Models and Predictive Mapping} \\\text{SAR SLM SDM and Random Forrest process and presentation}
+$$
+
+```{r}
+library(sf)       # For handling spatial data
+library(dplyr)    # For data manipulation
+library(lubridate)  # For working with date-time
+library(ggplot2)
+library(tidyr) 
+library(spdep)    # For spatial econometrics
+library(randomForest)  # For predictive modeling
+library(spatialreg)
+```
+
+
+```{r}
+# Load Data
+# ride <- read.csv2("D:/R Urban Analytics/code/KDE_Generated_Trip_Points_SAR.csv", sep = " ")
+ride <- synth_trip
+```
+
+
+```{r}
+district <- st_read("D:/R Urban Analytics/02/Bandra_OSM_data/Mumbai_Data_/mum_ward_bandra/mum_ward_bandra.shp")
+hex_grid <- st_read("D:/R Urban Analytics/02/Bandra_OSM_data/Mumbai_Data_/Grid_/Grid.shp")
+```
+
+```{r}
+# Convert ride data into an sf object
+ride_points <- st_as_sf(ride, coords = c("start_longitude", "start_latitude"), crs = 4326)
+
+# Spatial join: map rides to hexagonal grid
+ride_with_hex <- st_join(ride_points, hex_grid, join = st_within)
+
+# Extract temporal features
+ride_with_hex <- ride_with_hex %>%
+  mutate(StartTime = ymd_hms(start_datetime),
+         date = as_date(start_datetime),
+         hour = hour(start_datetime),
+         day_of_week = wday(start_datetime, label = TRUE))
+
+# Aggregate total demand by hexagon
+hex_demand <- ride_with_hex %>%
+  group_by(id) %>%
+  summarise(total_demand = n(), .groups = "drop")
+
+# Merge demand data with hex grid
+hex_grid_with_demand <- st_join(hex_grid, hex_demand) %>%
+  replace_na(list(total_demand = 0))
+
+# Create a spatial neighbors list
+hex_nb <- poly2nb(hex_grid)
+hex_weights <- nb2listw(hex_nb, style = "W", zero.policy = TRUE)
+```
+
+```{r}
+################################################################################
+################## Spatial Lag Model (SLM) #####################################
+################################################################################
+```
+
+```{r}
+# Add spatial lag of demand
+hex_grid_with_demand <- hex_grid_with_demand %>%
+  mutate(lag_demand = lag.listw(hex_weights, total_demand, zero.policy = TRUE))
+
+# Fit the Spatial Lag Model
+slm <- lagsarlm(total_demand ~ lag_demand, data = hex_grid_with_demand, listw = hex_weights, method = "eigen")
+summary(slm)
+```
+
+```{r}
+################################################################################
+################## Spatial Durbin Model (SDM) ##################################
+################################################################################
+```
+
+```{r}
+# Add population_density and lag_population_density
+hex_grid_with_demand <- hex_grid_with_demand %>%
+  mutate(population_density = sample(50:500, nrow(hex_grid_with_demand), replace = TRUE),
+         lag_population_density = lag.listw(hex_weights, population_density, zero.policy = TRUE))
+
+# Fit the Spatial Durbin Model
+sdm <- lagsarlm(total_demand ~ population_density + lag_population_density, 
+                data = hex_grid_with_demand, 
+                listw = hex_weights, 
+                method = "eigen")
+summary(sdm)
+```
+
+```{r}
+# Compare Models (e.g., AIC)
+cat("SLM AIC:", AIC(slm), "\n")
+cat("SDM AIC:", AIC(sdm), "\n")
+```
+
+
+
+```{r}
+################################################################################
+################## Predictive Modeling # Absolute ##############################
+################################################################################
+```
+
+
+```{r}
+# Feature engineering: add temporal and neighbor-based features
+prediction_data <- hex_grid_with_demand %>%
+  mutate(
+    avg_hourly_demand = total_demand / 24,
+    neighbor_avg_demand = lag.listw(hex_weights, total_demand, zero.policy = TRUE)
+  )
+
+# Split data into training and testing sets
+set.seed(42)
+train_indices <- sample(1:nrow(prediction_data), size = 0.8 * nrow(prediction_data))
+train_data <- prediction_data[train_indices, ]
+test_data <- prediction_data[-train_indices, ]
+
+# Fit a Random Forest model
+rf_model <- randomForest(total_demand ~ avg_hourly_demand + neighbor_avg_demand, data = train_data)
+summary(rf_model)
+
+# Predict on the test set
+predictions <- predict(rf_model, newdata = test_data)
+
+# Evaluate the model
+RMSE <- sqrt(mean((test_data$total_demand - predictions)^2))
+cat("RMSE of Predictions:", RMSE, "\n")
+
+# Add predictions to test data
+test_data <- test_data %>%
+  mutate(predicted_demand = predictions)
+```
+
+
+```{r}
+model_comparison <- data.frame(
+  Model = c("Spatial Lag Model", "Spatial Durbin Model"),
+  AIC = c(AIC(slm), AIC(sdm)),
+  RMSE = c(NA, RMSE)  # Add RMSE for models where applicable
+)
+knitr::kable(model_comparison, caption = "Model Performance Comparison")
+```
+
+```{r}
+# Filter out the 0 demand 
+test_data <-  test_data |> filter(total_demand > 0)
+```
+
+
+```{r}
+# Visualize predicted demand
+
+# Define the min and max of predicted demand
+min_demand <- floor(min(test_data$predicted_demand))
+max_demand <- ceiling(max(test_data$predicted_demand))
+```
+
+```{r}
+# Define bins and labels
+test_data <- test_data %>%
+  mutate(
+    demand_category = case_when(
+      predicted_demand <= quantile(predicted_demand, 0.33) ~ "Low",
+      predicted_demand > quantile(predicted_demand, 0.33) & predicted_demand <= quantile(predicted_demand, 0.66) ~ "Medium",
+      predicted_demand > quantile(predicted_demand, 0.66) ~ "High"
+    )
+  )
+```
+
+
+```{r}
+ggplot(test_data) +
+  geom_sf(data = district, fill = "white", color = "black", show.legend = TRUE) + 
+  geom_sf(data = hex_grid, fill = NA, color = "grey", show.legend = TRUE) + 
+  geom_sf(aes(fill = predicted_demand), color = "white") +
+  
+  # scale_fill_viridis_c(name = "Predicted Demand") +
+  
+  scale_fill_gradientn(
+    name = "Demand",
+    # colours = c("blue", "green", "yellow", "red"), # Custom color scheme
+    colours = c("blue", "green", "yellow", "red"), # Custom color scheme
+    values = scales::rescale(c(min_demand, (min_demand + max_demand) / 2, max_demand)), # Adjust range
+    limits = c(min_demand, max_demand) # Set limits explicitly
+  ) +
+  
+  
+  # geom_sf(aes(fill = demand_category), color = "white") +
+  # 
+  # scale_fill_manual(
+  #   name = "Predicted Demand",
+  #   values = c("Low" = "blue", "Medium" = "yellow", "High" = "red"), # Define colors for categories
+  #   labels = c("Low", "Medium", "High") # Define legend labels
+  # ) +
+  
+  
+  theme_minimal() +
+  labs(title = "Predicted Rideshare Demand by Hexagon",
+    subtitle = "Random Forest model predicted ",
+    caption = paste("RMSE of Predictions:", round(RMSE, 4)),
+    x = "Longitude", y = "Latitude") + 
+
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+```
+
+```{r}
+library(leaflet)
+library(sf)
+# 
+# # Define a color palette for predicted demand
+# demand_palette <- colorNumeric(
+#   palette = c("blue", "green", "yellow", "red"), # Custom color scheme
+#   domain = c(min_demand, max_demand)
+# )
+# 
+# # Create a leaflet map
+# leaflet() %>%
+#   # Add district boundaries
+#   addPolygons(
+#     data = district,
+#     color = "black",
+#     fillColor = "white",
+#     fillOpacity = 0.5,
+#     weight = 1,
+#     label = ~paste("District")
+#   ) %>%
+#   # Add hex grid
+#   addPolygons(
+#     data = hex_grid,
+#     color = "grey",
+#     fill = FALSE,
+#     weight = 1,
+#     label = ~paste("Hex ID:", id) # Replace hex_id with an actual identifier if available
+#   ) %>%
+#   # Add predicted demand as colored hexagons
+#   addPolygons(
+#     data = test_data,
+#     fillColor = ~demand_palette(predicted_demand),
+#     color = "white",
+#     weight = 0.5,
+#     fillOpacity = 0.7,
+#     label = ~paste("Demand:", predicted_demand)
+#   ) %>%
+#   # Add legend for predicted demand
+#   addLegend(
+#     pal = demand_palette,
+#     values = c(min_demand, max_demand),
+#     title = "Predicted Demand",
+#     position = "bottomright"
+#   ) %>%
+#   # Add scale bar
+#   addScaleBar(position = "bottomright") %>%
+#   # Add north arrow using an external plugin (optional, requires leaflet.extras)
+#   # addEasyButton() or plugins can be used for custom arrows
+#   # Add title and subtitle (add through HTML widgets, as leaflet itself doesn't support titles directly)
+#   htmlwidgets::onRender(
+#     "
+#     function(el, x) {
+#       var title = L.control({position: 'topright'});
+#       title.onAdd = function(map) {
+#         var div = L.DomUtil.create('div', 'info legend');
+#         div.innerHTML = '<h4>Predicted Rideshare Demand by Hexagon</h4><p>Random Forest model predicted</p>';
+#         return div;
+#       };
+#       title.addTo(this);
+#     }
+#     "
+#   )
+
+```
+
+```{r}
+# Check for missing geometries
+st_is_valid(district)
+st_is_valid(hex_grid)
+st_is_valid(test_data)
+
+# Check for missing values in predicted_demand
+any(is.na(test_data$predicted_demand))
+```
+
+```{r}
+nrow(district)
+nrow(hex_grid)
+nrow(test_data)
+```
+
+
+```{r}
+# test_data <- test_data %>% filter(!is.na(predicted_demand))
+```
+
+```{r}
+library(leaflet)
+# Create the color palette for predicted demand
+pal <- colorNumeric(palette = "YlOrRd", domain = na.omit(test_data$predicted_demand))
+```
+
+
+```{r}
+m <- leaflet() %>%
+  addTiles(urlTemplate = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", 
+           attribution = "&copy; <a href='https://www.openstreetmap.org/copyright'>OpenStreetMap</a> contributors &copy; <a href='https://carto.com/'>CARTO</a>") %>%
+  addPolygons(data = test_data,
+              fillColor = ~pal(predicted_demand),
+              color = "white",
+              weight = 1,
+              fillOpacity = 0.7,
+              group = "Predicted Demand") %>%
+  
+  # Add a legend for predicted_demand
+  addLegend(pal = pal,
+            values = test_data$predicted_demand,
+            opacity = 0.7,
+            title = "Predicted Demand",
+            position = "bottomright")
+
+
+m = m |>  setView(72.83, 19.065, zoom = 14) # 19.067248036344395, 72.83097197430348
+m  # a map with the default OSM tile layer
+```
+
+
+
+```{r}
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/Predicted Rideshare Demand by Hexagon Absolute.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+
+```
+
+
+```{r}
+################################################################################
+################## Predictive Modeling # Categorise ############################
+################################################################################
+```
+
+```{r}
+# Feature engineering: add temporal and neighbor-based features
+prediction_data <- hex_grid_with_demand %>%
+  mutate(
+    avg_hourly_demand = total_demand / 24,
+    neighbor_avg_demand = lag.listw(hex_weights, total_demand, zero.policy = TRUE)
+  ) %>%
+  # filter(total_demand > 0) %>%  # Remove rows with zero demand
+  mutate(
+    demand_category = case_when(
+      total_demand <= 1 ~ "Low",
+      total_demand <= 2 ~ "Medium",
+      TRUE ~ "High"
+    )
+  )
+```
+
+```{r}
+# Split data into training and testing sets
+set.seed(42)
+train_indices <- sample(1:nrow(prediction_data), size = 0.8 * nrow(prediction_data))
+train_data <- prediction_data[train_indices, ]
+test_data <- prediction_data[-train_indices, ]
+
+# Fit a Random Forest model
+rf_model <- randomForest(total_demand ~ avg_hourly_demand + neighbor_avg_demand, data = train_data)
+summary(rf_model)
+
+# Predict on the test set
+predictions <- predict(rf_model, newdata = test_data)
+
+# Evaluate the model
+RMSE <- sqrt(mean((test_data$total_demand - predictions)^2))
+cat("RMSE of Predictions:", RMSE, "\n")
+
+# Add predictions to test data
+test_data <- test_data %>%
+  mutate(
+    predicted_demand = predictions,
+    predicted_category = case_when(
+      predicted_demand <= 1 ~ "Low",
+      predicted_demand <= 2 ~ "Medium",
+      TRUE ~ "High"
+    )
+  )
+
+```
+
+```{r}
+# Visualize predicted demand with demand categories
+ggplot(test_data) +
+  geom_sf(data = district, fill = "white", color = "black", show.legend = TRUE) + 
+  geom_sf(data = hex_grid, fill = NA, color = "grey", show.legend = TRUE) + 
+  geom_sf(aes(fill = predicted_category), color = "white") +
+  scale_fill_manual(
+    name = "Demand",
+    values = c("Low" = "#9FD793", "Medium" = "#ffe402", "High" = "#f90e1e")
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Predicted Rideshare Demand by Hexagon",
+    subtitle = "Random Forest model predicted",
+    caption = paste("RMSE of Predictions:", round(RMSE, 4)),
+    x = "Longitude", y = "Latitude"
+  ) +
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+
+```
+
+
+```{r}
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/Predicted Rideshare Demand by Hexagon Category.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+
+```
+
+```{r}
+# Plot feature importance
+importance_values <- importance(rf_model)
+varImpPlot(rf_model, main = "Feature Importance")
+```
+
+
+```{r}
+library(rpart)
+library(rpart.plot)
+
+# Extract a single tree
+single_tree <- randomForest::getTree(rf_model, k = 1, labelVar = TRUE)
+
+# Visualize the tree (requires conversion to rpart object)
+tree <- rpart(total_demand ~ avg_hourly_demand + neighbor_avg_demand, data = train_data)
+rpart.plot(tree, main = "Single Decision Tree from Random Forest")
+```
+
+```{r}
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/Single Decision Tree from Random Forest.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+
+```{r}
+install.packages("pdp")
+```
+
+```{r}
+library(pdp)
+
+# Partial dependence for 'avg_hourly_demand'
+pdp_avg <- partial(rf_model, pred.var = "avg_hourly_demand", train = train_data)
+plotPartial(pdp_avg, main = "Partial Dependence: Avg Hourly Demand")
+```
+
+
+```{r}
+# Residual plot
+residuals <- test_data$total_demand - predictions
+plot(predictions, residuals,
+     xlab = "Predicted Values", 
+     ylab = "Residuals", 
+     main = "Residual Plot")
+abline(h = 0, col = "red")
+```
+
+```{r}
+# OOB error visualization
+plot(rf_model, main = "OOB Error vs. Number of Trees")
+```
+
+
+```{r}
+moran_test <- moran.test(hex_grid_with_demand$total_demand, hex_weights, zero.policy = TRUE)
+print(moran_test)
+```
+
+```{r}
+local_moran <- localmoran(hex_grid_with_demand$total_demand, hex_weights, zero.policy = TRUE)
+hex_grid_with_demand <- hex_grid_with_demand %>%
+  mutate(local_moran = local_moran[, 1])  # Extract I values
+```
+
+```{r}
+local_moran
+```
+
+```{r}
+# Create categorical labels for Local Moran's I values
+hex_grid_with_demand <- hex_grid_with_demand %>%
+  mutate(
+    local_moran_category = case_when(
+      local_moran > 0 & lag_demand > 0 ~ "High-High",
+      local_moran > 0 & lag_demand <= 0 ~ "High-Low",
+      local_moran <= 0 & lag_demand > 0 ~ "Low-High",
+      local_moran <= 0 & lag_demand <= 0 ~ "Low-Low"
+    )
+  )
+
+# Convert the categories to a factor for ordering in the legend
+hex_grid_with_demand$local_moran_category <- factor(
+  hex_grid_with_demand$local_moran_category,
+  levels = c("Low-Low", "Low-High", "High-Low", "High-High")
+)
+```
+
+
+```{r}
+# Classified Moran's I
+ggplot(hex_grid_with_demand) + 
+  geom_sf(aes(fill = local_moran_category), color = "white") +  
+  geom_sf(data = district, fill = NA, color = "black", show.legend = TRUE) + 
+  geom_sf(data = hex_grid, fill = NA, color = "grey", show.legend = TRUE) + 
+  
+    scale_fill_manual(
+    values = c(
+      "Low-Low" = "#37A5D2",
+      "Low-High" = "#CBEBF6",
+      "High-Low" = "#F6BD4B",
+      "High-High" = "#E61D3B"
+    ),
+    name = "Cluster Type"
+  ) +
+  
+  theme_minimal() +
+  labs(title = "Local Moran's I Clusters", fill = "I Value",
+    subtitle = "Spatial Clustering of Predicted Demand",
+    caption = "Generated using RF model and Moran's I",
+    x = "Longitude", y = "Latitude") + 
+
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+
+```
+
+
+```{r}
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/Local Morans I Clusters Category.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+
+```{r}
+# Absolute Values
+ggplot(hex_grid_with_demand) +
+  geom_sf(aes(fill = local_moran), color = "white") +
+  geom_sf(data = district, fill = NA, color = "black", show.legend = TRUE) + 
+  geom_sf(data = hex_grid, fill = NA, color = "grey", show.legend = TRUE) + 
+  
+  scale_fill_gradient2(midpoint = 0, low = "#009FFF", mid = "white", high = "#ec2F4B") +
+  labs(title = "Local Moran's I Clusters", fill = "I Value") +
+  
+  theme_minimal() +
+  labs(title = "Local Moran's I Clusters", fill = "I Value",
+    subtitle = "Spatial Clustering of Predicted Demand",
+    caption = "Generated using RF model and Moran's I",
+    x = "Longitude", y = "Latitude") + 
+
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+```
+
+```{r}
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/Local Morans I Clusters Absolute.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+

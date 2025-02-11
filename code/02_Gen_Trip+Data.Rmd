@@ -1,0 +1,501 @@
+---
+title: "Generate Trip Data"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+$$
+\textbf{Objective:}\\
+\text{Generate Trip Data from the Points generated in the previous script} \\\text{KDE and SAR process and presentation}
+$$
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(sf)
+library(lubridate)
+library(spatstat)
+library(spdep)
+library(ggplot2)
+library(ggspatial)
+library(RColorBrewer)
+```
+
+```{r}
+# Load the generated points
+points_df <-  st_read("D:/R Urban Analytics/code/01_KDE_Trip_points/KDE_Generated_Trip_Points.shp")
+
+# Load the polygon (city district)
+district <- st_read("D:/R Urban Analytics/02/Bandra_OSM_data/Mumbai_Data_/mum_ward_bandra/mum_ward_bandra.shp")
+```
+
+
+```{r}
+# Ensure geometries are valid and consistent
+district <- st_make_valid(district)
+
+# Reproject all layers to a common projected CRS (UTM Zone 43N)
+projected_crs <- 32643
+
+# Ensure CRS consistency
+district <- st_transform(district, projected_crs)
+```
+
+
+```{r}
+# Ensure `points_df` has at least two points
+if (nrow(points_df) < 2) {
+  stop("Not enough points to create trips. Ensure `points_df` has at least two points.")
+}
+
+# Ensure `points_df` is an sf object
+if (!inherits(points_df, "sf")) {
+  stop("points_df must be an sf object.")
+}
+```
+
+```{r}
+# Project to a suitable planar CRS (UTM Zone 43N for Mumbai)
+points_df_projected <- st_transform(points_df, crs = 32643)
+
+# Convert to spatstat's ppp format
+coords <- st_coordinates(points_df_projected)
+bbox <- st_bbox(points_df_projected)
+window <- as.owin(st_as_sfc(bbox))
+points_ppp <- as.ppp(coords, W = window)
+
+# Perform KDE
+kde <- density(points_ppp, sigma = 0.1)
+
+# Extract KDE values for all points using spatstat's interp.im
+kde_values <- interp.im(kde, coords[, 1], coords[, 2])
+
+# Handle NA values if present
+if (any(is.na(kde_values))) {
+  warning("NA values found in KDE results. Assigning NA to these points.")
+}
+
+# Create a full vector of KDE values with NA for missing points
+kde_values_full <- rep(NA, nrow(points_df))
+kde_values_full[seq_along(kde_values)] <- kde_values
+
+# Normalize KDE values (only non-NA values)
+if (all(is.finite(kde_values_full))) {
+  kde_values_full <- kde_values_full / sum(kde_values_full, na.rm = TRUE)
+  kde_values_full <- kde_values_full^2 / sum(kde_values_full^2, na.rm = TRUE)
+}
+
+# Add KDE values to `points_df`
+points_df$kde_value <- kde_values_full
+
+# Verify that lengths match
+if (length(points_df$kde_value) != nrow(points_df)) {
+  stop("Mismatch in KDE values and points_df rows after processing.")
+}
+
+# Summary of updated `points_df`
+summary(points_df)
+
+
+length(kde_values)
+nrow(points_df)
+
+
+# Handle NA values in kde_values
+kde_values[is.na(kde_values)] <- 0
+
+# Normalize KDE values after handling NA
+if (sum(kde_values) > 0) {
+  kde_values <- kde_values / sum(kde_values)
+} else {
+  stop("All KDE values are zero. Check your KDE computation.")
+}
+
+# Verify lengths match
+if (length(kde_values) != nrow(points_df)) {
+  stop("Mismatch in KDE values and points_df rows after handling missing values.")
+}
+```
+
+```{r}
+# Summary of updated `points_df`
+summary(points_df)
+```
+
+```{r}
+length(kde_values)
+nrow(points_df)
+
+
+# Handle NA values in kde_values
+kde_values[is.na(kde_values)] <- 0
+
+# Normalize KDE values after handling NA
+if (sum(kde_values) > 0) {
+  kde_values <- kde_values / sum(kde_values)
+} else {
+  stop("All KDE values are zero. Check your KDE computation.")
+}
+
+# Verify lengths match
+if (length(kde_values) != nrow(points_df)) {
+  stop("Mismatch in KDE values and points_df rows after handling missing values.")
+}
+
+# Define the number of trips to simulate
+n_trips <- 500  # Adjust this number based on your analysis needs
+
+# Generate random trips weighted by KDE
+trips <- tibble(
+  trip_id = 1:n_trips,
+  start_index = sample(1:nrow(points_df), n_trips, replace = TRUE, prob = kde_values),
+  end_index = sample(1:nrow(points_df), n_trips, replace = TRUE, prob = kde_values)
+) %>%
+  # Ensure no self-loops (start and end at the same point)
+  filter(start_index != end_index) %>%
+  mutate(
+    # Extract start and end coordinates
+    start_latitude = st_coordinates(points_df)[start_index, 2],
+    start_longitude = st_coordinates(points_df)[start_index, 1],
+    end_latitude = st_coordinates(points_df)[end_index, 2],
+    end_longitude = st_coordinates(points_df)[end_index, 1],
+    
+    # Random travel time between 5 and 30 minutes
+    travel_time_min = sample(5:30, n(), replace = TRUE),
+    
+    # Generate random start times
+    start_datetime = ymd_hms("2024-01-01 00:00:00") +
+      minutes(sample(0:1440, n(), replace = TRUE)),  # Random minutes within a day
+    
+    # Calculate end times based on travel time
+    end_datetime = start_datetime + minutes(travel_time_min)
+  )
+
+# View a summary of the trips
+summary(trips)
+
+# Convert trips to an sf object
+trips_sf <- trips %>%
+  mutate(
+    geometry_start = st_sfc(
+      mapply(function(x, y) st_point(c(x, y)), start_longitude, start_latitude, SIMPLIFY = FALSE),
+      crs = 4326
+    ),
+    geometry_end = st_sfc(
+      mapply(function(x, y) st_point(c(x, y)), end_longitude, end_latitude, SIMPLIFY = FALSE),
+      crs = 4326
+    )
+  ) %>%
+  st_as_sf()
+```
+
+
+
+```{r}
+# Convert start points to a spatial object
+start_coords <- st_coordinates(trips_sf %>% select(geometry_start))
+start_ppp <- as.ppp(start_coords, W = as.owin(st_as_sfc(st_bbox(district))))
+
+# Calculate Moran's I start points
+neighbors <- knearneigh(start_coords, k = 5)
+weights <- nb2listw(knn2nb(neighbors))
+moran_test_start <- moran.test(start_coords[, 1], listw = weights)
+print(moran_test_start)
+
+# Convert end points to a spatial object
+end_coords <- st_coordinates(trips_sf %>% select(geometry_end))
+end_ppp <- as.ppp(end_coords, W = as.owin(st_as_sfc(st_bbox(district))))
+
+# Calculate Moran's I end points
+neighbors_end <- knearneigh(end_coords, k = 5)
+weights_end <- nb2listw(knn2nb(neighbors_end))
+moran_test_end <- moran.test(end_coords[, 1], listw = weights_end)
+print(moran_test_end)
+```
+
+```{r}
+# Verify the synthetic trip data
+print(trips_sf)
+
+synth_trip <- trips_sf
+
+summary(synth_trip)
+```
+
+```{r}
+# Define the output file path for CSV
+output_file_csv <- "D:/R Urban Analytics/code/KDE_Generated_Trip_Points_SAR.csv"
+
+# Convert the sf object to a data frame and save as CSV
+write.csv(st_as_sf(trips_sf), output_file_csv, row.names = FALSE)
+
+# Confirmation message
+cat("CSV saved to:", output_file_csv, "\n")
+```
+
+$$
+\textbf{Plot and save the Trip Data}
+$$ 
+```{r}
+plot(synth_trip)
+```
+
+```{r}
+# Plot a histogram of travel_time_min
+ggplot(synth_trip, aes(x = travel_time_min)) +
+  geom_histogram(binwidth = 1, fill = "#4287f5", color = "white") +
+  labs(title = "Distribution of Travel Time", 
+       x = "Travel Time (minutes)", 
+       y = "Frequency") +
+  theme_minimal() + 
+    scale_x_continuous(
+    breaks = seq(0, max(synth_trip$travel_time_min), by = 2),  # Adjust x-axis tick spacing
+    minor_breaks = seq(0, max(synth_trip$travel_time_min), by = 1)  # Add minor ticks
+  ) +
+  scale_y_continuous(
+    breaks = scales::pretty_breaks(n = 10),  # Adjust y-axis ticks for better granularity
+    minor_breaks = NULL  # Optional: Add minor y-axis ticks if needed
+  )
+```
+
+```{r}
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/02_travel_time.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 8.3,              # Width of the image in inches
+  height = 5.8,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+
+```{r}
+# Extract start points
+pt_start <- data.frame(longitude = synth_trip$start_longitude,
+                         latitude = synth_trip$start_latitude)
+
+# Convert start points to sf object # # Reproject the CRS from UTM to EPSG:4326 (WGS 84)
+pt_start_sf <- st_as_sf(pt_start, coords = c("longitude", "latitude"), crs = 4326)
+
+# Extract end points
+pt_end <- data.frame(longitude = synth_trip$end_longitude,
+                         latitude = synth_trip$end_latitude)
+
+# Convert end points to sf object # # Reproject the CRS from UTM to EPSG:4326 (WGS 84)
+pt_end_sf <- st_as_sf(pt_end, coords = c("longitude", "latitude"), crs = 4326)
+```
+
+```{r}
+# Define Consistent Coordinate Limits
+
+# Get the bounding box of the district layer
+bbox <- st_bbox(district)
+
+# Define padding as a percentage of the range
+padding_factor <- 0.05  # 5% padding
+
+# Get the bounding box of the district layer
+xrange <- bbox["xmax"] - bbox["xmin"]
+yrange <- bbox["ymax"] - bbox["ymin"]
+
+xlim <- c(bbox["xmin"] - xrange * padding_factor, bbox["xmax"] + xrange * padding_factor)
+ylim <- c(bbox["ymin"] - yrange * padding_factor, bbox["ymax"] + yrange * padding_factor)
+```
+
+
+```{r}
+
+ggplot() + 
+  # Base map of the district
+  geom_sf(data = district, fill = "azure", color = "black", show.legend = FALSE) +   
+  
+  # Start Points
+  geom_sf(data = pt_start_sf, aes(color = "Start Points"), size = 1) +
+
+  # End Points
+  geom_sf(data = pt_end_sf, aes(color = "End Points"), size = 1) +
+   
+  scale_color_manual(
+    name = "Legend", 
+    values = c(
+      "Start Points" = "orange", 
+      "End Points" = "blue"
+    )
+  ) +
+  coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+  theme_minimal() + 
+  # Add titles and captions
+  labs(
+    title = "Distribution of Start and End Locations",
+    subtitle = "Visualizing spatial trends from the KDE-generated points",
+    caption = "KDE analysis with Poisson point process clustering",
+    x = "Longitude", y = "Latitude"
+  ) + 
+
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+```
+
+```{r}
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/02_start_end_point.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+```{r}
+# Visualize KDE on district map
+ggplot() +
+  geom_sf(data = district, fill = "azure", color = "black", alpha = 0.5) +
+  geom_raster(data = as.data.frame(as.im(kde)), 
+              aes(x = x, y = y, fill = value), alpha = 0.7) +
+  scale_fill_viridis_c(option = "magma", name = "KDE Intensity") +
+  labs(title = "Kernel Density Estimation (KDE)",     
+    subtitle = "KDE for Simulated Trip Points",
+    caption = "spatial clustering patterns derived using weighted probability distribution",
+    x = "Longitude", y = "Latitude") +
+  theme_minimal()+ 
+
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+```
+
+```{r}
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/02_KDE_district_map.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+
+```{r}
+# Visualize hotspots using KDE
+hotspots <- as.data.frame(as.im(kde)) %>%
+  filter(value > quantile(value, 0.95))  # Top 5% KDE values
+
+ggplot() +
+  geom_sf(data = district, fill = "lightgrey", color = "black", alpha = 0.5) +
+  geom_raster(data = hotspots, aes(x = x, y = y, fill = value), alpha = 0.7) +
+  scale_fill_viridis_c(option = "inferno", name = "Hotspot Intensity") +
+  labs(title = "Hotspot Analysis (Top 5% KDE)",     
+       subtitle = "Spatial Distribution of Trip Hotspots Identified through KDE",
+       caption = "higher density indicate regions of concentrated trip activity",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal()+ 
+
+  # Add the north arrow with inset positioning
+  annotation_north_arrow(
+    location = "br",  # Bottom-right
+    which_north = "true", 
+    style = north_arrow_minimal(),
+    pad_x = unit(-1, "lines"), # Move outside horizontally
+    pad_y = unit(2, "lines") # Adjust vertical padding
+  ) +
+  # Add the scale bar with inset positioning
+  annotation_scale(
+    location = "br",   # Bottom-right
+    width_hint = 0.4,  # Adjust relative size
+    pad_x = unit(0, "lines"), # Move outside horizontally
+    pad_y = unit(1, "lines"), # Adjust vertical padding
+    style = "ticks",   # Tick-style scale bar
+    unit_category = "metric" # Metric units
+  ) +
+  # Adjust legend placement and layout
+  theme(
+    legend.position = c(1.35, 0.25), # Place legend in the bottom-right
+    legend.box = "vertical"          # Stack legend items vertically
+  )
+```
+
+```{r}
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/02_KDE_hotspots.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 11.7,              # Width of the image in inches
+  height = 8.3,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
+
+```{r}
+# Calculate direction of trips
+synth_trip <- synth_trip %>%
+  mutate(direction = atan2(end_latitude - start_latitude, 
+                           end_longitude - start_longitude) * 180 / pi)
+
+# Visualize directional distribution
+ggplot(synth_trip, aes(x = direction)) +
+  geom_histogram(binwidth = 10, fill = "#1f78b4", color = "white") +
+  coord_polar() +
+  labs(title = "Directional Distribution of Trips",
+       x = "Direction (Degrees)", y = "Frequency") +
+  theme_minimal()
+```
+
+```{r}
+# Save the plot
+ggsave(
+  filename = "D:/R Urban Analytics/code/plots/02_trip_ditections.png",
+  plot = last_plot(),      # Use the last plot created
+  device = "png",          # File format (PNG in this case)
+  width = 8.3,              # Width of the image in inches
+  height = 5.8,              # Height of the image in inches
+  dpi = 300                # Resolution of the image
+)
+```
+
